@@ -1,0 +1,27 @@
+# Core data stack
+pandas>=2.0.0
+numpy>=1.24.0
+requests>=2.31.0
+tqdm>=4.66.0
+
+# ML
+scikit-learn>=1.4.0
+xgboost>=2.0.0
+imbalanced-learn>=0.12.0    # SMOTE for class imbalance
+
+# Visualization / UI
+streamlit>=1.35.0
+plotly>=5.20.0
+
+# Market data (for Altman Z market cap)
+yfinance>=0.2.40
+
+# Fuzzy matching (AAER → EDGAR name matching)
+rapidfuzz>=3.6.0
+
+# HTML parsing (AAER scraper)
+beautifulsoup4>=4.12.0
+lxml>=5.0.0
+
+# Storage
+pyarrow>=14.0.0             # parquet read/write

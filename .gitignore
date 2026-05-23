@@ -1,0 +1,46 @@
+# ── Python ────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# ── Environments ──────────────────────────────────────
+.env
+.venv
+env/
+venv/
+
+# ── Data (large, regeneratable via pipeline) ──────────
+data/raw/            # EDGAR JSON cache — rebuild with build_dataset.py
+data/processed/      # Parquet outputs  — rebuild with build_dataset.py
+
+# Keep label files (small, slow to scrape — commit them)
+!data/labels/
+!data/labels/*.csv
+
+# ── Model artifacts ───────────────────────────────────
+# Commit the final trained model so Streamlit Cloud can load it
+# (XGBoost model is ~1-5MB — fine for git)
+# models/ is tracked — DO NOT add to gitignore
+
+# ── Logs & temp ───────────────────────────────────────
+pipeline_run.log
+*.log
+*.tmp
+
+# ── OS ────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+
+# ── IDE ───────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+
+# ── Jupyter ───────────────────────────────────────────
+.ipynb_checkpoints/
