@@ -61,10 +61,11 @@ def attach_fraud_labels(feat_df: pd.DataFrame,
     """
     fraud_df = fraud_df[["cik", "fraud_date"]].dropna().copy()
     fraud_df["fraud_year"] = pd.to_datetime(fraud_df["fraud_date"]).dt.year
-    fraud_df["cik"]        = fraud_df["cik"].astype(str)
+    # Zero-pad to 10 digits so they match feat_df's format
+    fraud_df["cik"]        = fraud_df["cik"].astype(str).str.zfill(10)
 
     feat_df = feat_df.copy()
-    feat_df["cik"] = feat_df["cik"].astype(str)
+    feat_df["cik"] = feat_df["cik"].astype(str).str.zfill(10)
 
     # Create a year range for each fraud company
     fraud_ranges = []

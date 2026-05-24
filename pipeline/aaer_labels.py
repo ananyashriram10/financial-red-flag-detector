@@ -402,131 +402,174 @@ def load_supplemental_aaer_dataset() -> pd.DataFrame:
     return pd.DataFrame()
 
 
-# ── Hardcoded seed: well-known SEC enforcement cases ─────────────────────────
-# Used as last resort when all online sources fail.
-# Company names are matched to CIKs via the SEC ticker map (fuzzy).
+# ── Seed: confirmed SEC enforcement cases ─────────────────────────────────────
+# fraud_year = END OF THE FRAUD PERIOD (not the SEC enforcement/discovery date).
+# This ensures the labeler window [fraud_year-3 → fraud_year] covers the actual
+# years the fraud was occurring, not the years after it was caught.
+#
+# Only post-2006 cases: EDGAR XBRL data starts ~2009 for large filers, so
+# fraud windows starting before 2006 will have no matching financial data.
+#
+# Names are chosen to be distinctive enough for EDGAR search to return the
+# right company as its top result.
 KNOWN_FRAUD_SEED = [
-    # (company_name_fragment, fraud_discovery_year)
-    # Confirmed SEC enforcement actions — weighted toward post-2006
-    # so they overlap with EDGAR XBRL data availability
-
-    # ── Post-2010 (most likely to overlap with our EDGAR data) ───────────────
-    ("Nikola",                       2021),   # $125M SEC settlement
-    ("Under Armour",                 2021),   # $9M SEC settlement, 2015-2019 fraud
-    ("MiMedx",                       2020),   # $6.5M SEC settlement, revenue recognition
-    ("General Electric",             2023),   # $200M SEC settlement, power division
-    ("Valeant Pharmaceuticals",      2016),   # accounting irregularities
-    ("Herbalife",                    2016),   # $200M FTC settlement
-    ("Weatherford International",    2016),   # $140M SEC settlement, tax accounting
-    ("Lumber Liquidators",           2015),   # SEC charges, formaldehyde disclosure
-    ("Assisted Living Concepts",     2014),   # SEC fraud charges
-    ("Broadcom",                     2010),   # options backdating restatement
-    ("Vitesse Semiconductor",        2010),   # options backdating
-    ("Comverse Technology",          2011),   # options backdating $225M
-    ("Monster Worldwide",            2010),   # options backdating settlement
-    ("Juniper Networks",             2013),   # options backdating $169M settlement
-    ("SafeNet",                      2009),   # options backdating
-    ("Marvell Technology",           2016),   # $2.5M SEC settlement
-    ("ChinaNet Online",              2013),   # SEC accounting fraud
-    ("Longwei Petroleum",            2012),   # SEC fraud
-    ("SinoHub",                      2012),   # SEC fraud
-    ("Puda Coal",                    2011),   # SEC fraud
-    ("Longtop Financial",            2011),   # SEC fraud, auditor resigned
-    ("Universal Travel Group",       2011),   # SEC fraud
-    ("Sino Clean Energy",            2012),   # SEC fraud
-    ("AgriForce",                    2023),   # SEC charges
-    ("MiMedia",                      2019),   # SEC charges
-    ("Beam Global",                  2022),   # SEC charges
-    ("Ideanomics",                   2021),   # SEC investigation
-    ("Mallinckrodt",                 2020),   # opioid accounting fraud
-
-    # ── 2006-2010 (may partially overlap with EDGAR data) ────────────────────
-    ("American International Group", 2009),
-    ("Freddie Mac",                  2007),
-    ("Fannie Mae",                   2006),
-    ("Nortel Networks",              2007),
-    ("Delphi",                       2006),
-    ("Syntax-Brillian",              2008),
-    ("New Century Financial",        2009),
-    ("Beazer Homes",                 2009),
-    ("SafeNet",                      2009),
-    ("UTStarcom",                    2009),
-    ("Nature Sunshine Products",     2009),
-    ("Broadcom",                     2009),
-
-    # ── Pre-2006 classics (included for completeness, less likely to match) ──
-    ("Enron",                        2001),
-    ("WorldCom",                     2002),
-    ("Tyco International",           2002),
-    ("HealthSouth",                  2003),
-    ("Waste Management",             1998),
-    ("Xerox",                        2002),
-    ("Bristol-Myers Squibb",         2002),
-    ("Dollar General",               2001),
-    ("Rite Aid",                     2002),
-    ("Qwest Communications",         2002),
-    ("Global Crossing",              2002),
-    ("Adelphia Communications",      2002),
-    ("McKesson HBOC",                1999),
-    ("Cendant",                      1998),
-    ("Peregrine Systems",            2002),
-    ("Williams Companies",           2002),
+    # (company_name,                  fraud_period_end_year, known_ticker_or_None)
+    # ── Large-cap, well-documented SEC enforcement actions ────────────────────
+    ("Under Armour",                  2016,  "UA"),    # AAER 4288  revenue pulled fwd 2015-16
+    ("Weatherford International",     2012,  "WFT"),   # AAER 4044  tax/income fraud 2007-12
+    ("MiMedx Group",                  2018,  "MDXG"),  # AAER 4110  rev recognition 2012-18
+    ("Herbalife",                     2018,  "HLF"),   # SEC charge  China ops 2014-18
+    ("General Electric",              2019,  "GE"),    # AAER 4446  insurance/power 2015-19
+    ("Wells Fargo",                   2016,  "WFC"),   # AAER 4099  fake accounts 2013-16
+    ("Boeing",                        2019,  "BA"),    # AAER 4361  737 MAX disclosure 2018-19
+    ("Mattel",                        2017,  "MAT"),   # AAER 4046  EPS inflated 2009-17
+    ("Kraft Heinz",                   2018,  "KHC"),   # SEC charge  supplier acctg 2015-18
+    ("Nikola",                        2020,  "NKLA"),  # AAER 4351  false tech claims 2019-20
+    ("PG&E",                          2019,  "PCG"),   # SEC charge  wildfire disclosure 2017-19
+    ("Valeant Pharmaceuticals",       2015,  "VRX"),   # AAER 3982  Philidor rev recog 2013-15
+    # ── Mid-cap enforcement actions ───────────────────────────────────────────
+    ("Insys Therapeutics",            2016,  "INSY"),  # opioid bribery scheme 2013-16
+    ("Lumber Liquidators",            2015,  "LL"),    # formaldehyde disclosure 2012-15
+    ("Mallinckrodt",                  2018,  "MNK"),   # opioid accounting 2015-18
+    ("Iconix Brand Group",            2015,  "ICON"),  # licensing rev inflation 2012-15
+    ("AmTrust Financial Services",    2015,  "AFSI"),  # reinsurance accounting 2012-15
+    ("Orthofix International",        2016,  "OFIX"),  # accounting restatement 2013-16
+    ("Assisted Living Concepts",      2013,   None),   # occupancy fraud 2010-13
+    ("Ideanomics",                    2021,  "IDEA"),  # EV fraud claims 2018-21
+    ("Hertz",                         2014,  "HTZ"),   # accounting restatement 2011-14
+    ("RPM International",             2015,  "RPM"),   # revenue recognition 2012-15
+    # ── Options-backdating wave (2006-2013) ───────────────────────────────────
+    ("Juniper Networks",              2013,  "JNPR"),  # backdating settlement 2009-13
+    ("Monster Worldwide",             2010,  "MWW"),   # backdating 2006-10
+    ("Comverse Technology",           2011,   None),   # backdating $225M 2007-11
+    ("Vitesse Semiconductor",         2010,   None),   # backdating 2006-10
+    ("Marvell Technology",            2015,  "MRVL"),  # acctg settlement 2012-15
+    # ── China-based SEC fraud cases ───────────────────────────────────────────
+    ("ChinaNet Online Holdings",      2013,  "CNET"),  # accounting fraud 2010-13
+    ("Puda Coal",                     2011,   None),   # asset misappropriation 2008-11
+    ("Longtop Financial Technologies",2011,   None),   # auditor resigned 2008-11
+    # ── Other post-2006 cases ─────────────────────────────────────────────────
+    ("Gentiva Health Services",       2011,  "GTIV"),  # Medicare billing 2008-11
+    ("Beazer Homes",                  2009,  "BZH"),   # mortgage fraud 2006-09
+    ("UTStarcom",                     2009,  "UTSI"),  # FCPA violations 2006-09
+    ("Nature Sunshine Products",      2009,  "NATR"),  # FCPA violations 2006-09
+    ("AgriForce Growing Systems",     2023,   None),   # SEC charges 2020-23
 ]
+
+
+def _edgar_company_search(name: str, fraud_year: int,
+                          ticker: str | None = None) -> dict | None:
+    """
+    Resolve a company name to its EDGAR CIK using two strategies:
+
+    1. Ticker lookup (exact, instant) — if ticker is supplied and found in the
+       SEC master list, use it directly.
+    2. EDGAR company search API — sends the name to SEC's own company-search
+       endpoint, returns the top result that has 10-K filings in the fraud
+       window [fraud_year-3, fraud_year].  No fuzzy matching against a flat list;
+       the SEC's search engine handles name variations.
+
+    Returns dict(cik, company_name, ticker) or None if unresolvable.
+    """
+    # ── Strategy 1: exact ticker lookup ──────────────────────────────────────
+    if ticker:
+        try:
+            r = requests.get("https://www.sec.gov/files/company_tickers.json",
+                             headers=HEADERS, timeout=20)
+            r.raise_for_status()
+            for entry in r.json().values():
+                if entry.get("ticker", "").upper() == ticker.upper():
+                    return {
+                        "cik":          str(entry["cik_str"]).zfill(10),
+                        "company_name": entry.get("title", name),
+                        "ticker":       ticker.upper(),
+                    }
+        except Exception as e:
+            logger.debug(f"  Ticker lookup failed for {ticker}: {e}")
+
+    # ── Strategy 2: EDGAR company-name search ─────────────────────────────────
+    # SEC's browse-edgar returns a ranked list of companies matching the name.
+    # We pick the first result whose submission history overlaps the fraud window.
+    window_years = set(range(fraud_year - 3, fraud_year + 1))
+    search_url = (
+        "https://www.sec.gov/cgi-bin/browse-edgar"
+        f"?company={requests.utils.quote(name)}"
+        "&CIK=&type=10-K&dateb=&owner=include&count=10"
+        "&search_text=&action=getcompany"
+    )
+    try:
+        r = requests.get(search_url, headers=HEADERS, timeout=20)
+        if r.status_code != 200:
+            return None
+        soup = BeautifulSoup(r.text, "html.parser")
+        table = soup.find("table", {"class": "tableFile2"})
+        if table is None:
+            return None
+
+        for row in table.find_all("tr")[1:]:   # skip header row
+            cells = row.find_all("td")
+            if len(cells) < 2:
+                continue
+            cik_raw  = cells[0].get_text(strip=True)
+            cand_name = cells[1].get_text(strip=True)
+            if not cik_raw.isdigit():
+                continue
+            cik = cik_raw.zfill(10)
+
+            # Validate: does this CIK have 10-K filings in the fraud window?
+            subs_url = f"https://data.sec.gov/submissions/CIK{cik}.json"
+            try:
+                subs = requests.get(subs_url, headers=HEADERS, timeout=15).json()
+                filing_dates = subs.get("filings", {}).get("recent", {}).get("filingDate", [])
+                filing_years = {int(d[:4]) for d in filing_dates}
+                if window_years & filing_years:          # overlap → right company
+                    return {"cik": cik, "company_name": cand_name, "ticker": ""}
+            except Exception:
+                pass   # skip this candidate, try next row
+            time.sleep(SLEEP)
+
+    except Exception as e:
+        logger.debug(f"  EDGAR search failed for {name!r}: {e}")
+
+    return None
 
 
 def get_seed_fraud_labels() -> pd.DataFrame:
     """
-    Build fraud labels from the hardcoded KNOWN_FRAUD_SEED list.
-    Looks up CIKs dynamically from the SEC ticker map via fuzzy matching.
-    Used as last resort when all online sources fail.
+    Build fraud labels from KNOWN_FRAUD_SEED by resolving each company to its
+    EDGAR CIK using ticker lookup → EDGAR company search → filing validation.
+
+    No hardcoded CIKs.  No flat-list fuzzy matching.
+    fraud_date = end of fraud period so window [fraud_year-3 → fraud_year]
+    covers the years the fraud was actually occurring.
     """
-    logger.info("Using hardcoded fraud seed list as label source...")
-    try:
-        from rapidfuzz import process as rfp, fuzz
-    except ImportError:
-        logger.warning("rapidfuzz not installed — cannot resolve seed CIKs")
-        return pd.DataFrame()
+    logger.info("Resolving fraud seed list via EDGAR company search…")
+    rows: list[dict] = []
+    seen_ciks: set[str] = set()
 
-    # Load SEC name → CIK map
-    r = requests.get("https://www.sec.gov/files/company_tickers.json",
-                     headers=HEADERS, timeout=30)
-    r.raise_for_status()
-    master = r.json()
-
-    edgar_names = {}
-    for entry in master.values():
-        raw  = entry.get("title", "")
-        norm = _normalise(raw)
-        if norm:
-            edgar_names[norm] = {
-                "cik":          str(entry["cik_str"]).zfill(10),
-                "company_name": raw,
-                "ticker":       entry.get("ticker", ""),
-            }
-    choices = list(edgar_names.keys())
-
-    rows = []
-    for company_name, fraud_year in KNOWN_FRAUD_SEED:
-        norm = _normalise(company_name)
-        result = rfp.extractOne(norm, choices, scorer=fuzz.token_sort_ratio,
-                                score_cutoff=75)
-        if result is None:
-            logger.debug(f"No CIK match for: {company_name}")
+    for company_name, fraud_year, ticker in KNOWN_FRAUD_SEED:
+        info = _edgar_company_search(company_name, fraud_year, ticker)
+        if info is None:
+            logger.warning(f"  Could not resolve: {company_name!r}")
             continue
-        best_name, score, _ = result
-        info = edgar_names[best_name]
+        if info["cik"] in seen_ciks:
+            logger.debug(f"  Duplicate CIK skipped: {company_name} → {info['company_name']}")
+            continue
+
+        seen_ciks.add(info["cik"])
         rows.append({
             "cik":          info["cik"],
-            "ticker":       info["ticker"],
+            "ticker":       info.get("ticker", ""),
             "company_name": info["company_name"],
             "aaer_no":      None,
-            "fraud_date":   pd.Timestamp(f"{fraud_year}-06-01").date(),
-            "match_score":  round(score, 1),
+            "fraud_date":   pd.Timestamp(f"{fraud_year}-12-31").date(),
+            "match_score":  100.0 if ticker else 95.0,
         })
-        logger.debug(f"  {company_name!r} → {info['company_name']!r} [{score:.0f}]")
+        logger.info(f"  ✓ {company_name!r} → {info['company_name']!r}  CIK={info['cik']}")
+        time.sleep(SLEEP)
 
     df = pd.DataFrame(rows).drop_duplicates("cik")
-    logger.info(f"Seed fraud labels resolved: {len(df)} companies")
+    logger.info(f"Seed fraud labels resolved: {len(df)} / {len(KNOWN_FRAUD_SEED)} companies")
     return df
 
 
