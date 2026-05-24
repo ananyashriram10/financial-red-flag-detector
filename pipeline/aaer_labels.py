@@ -58,7 +58,11 @@ HEADERS = {
 }
 
 AAER_BASE  = "https://www.sec.gov"
-AAER_INDEX = "https://www.sec.gov/divisions/enforce/enforcea.htm"
+# SEC reorganised their site — try both URLs
+AAER_URLS = [
+    "https://www.sec.gov/litigation/aaers.htm",
+    "https://www.sec.gov/divisions/enforce/enforcea.htm",   # old URL, kept as fallback
+]
 
 SLEEP = 0.15   # between SEC requests
 
@@ -67,11 +71,23 @@ SLEEP = 0.15   # between SEC requests
 def scrape_aaer_index() -> list[dict]:
     """
     Download the main AAER index and parse all entries.
+    Tries multiple URLs in case SEC has reorganised the site.
     Returns a list of dicts: {aaer_no, date_str, raw_text, url}
     """
-    logger.info("Fetching AAER index page…")
-    r = requests.get(AAER_INDEX, headers=HEADERS, timeout=30)
-    r.raise_for_status()
+    r = None
+    for url in AAER_URLS:
+        try:
+            logger.info(f"Fetching AAER index: {url}")
+            r = requests.get(url, headers=HEADERS, timeout=30)
+            if r.status_code == 200:
+                break
+            logger.warning(f"  {url} → {r.status_code}")
+        except Exception as e:
+            logger.warning(f"  {url} → {e}")
+
+    if r is None or r.status_code != 200:
+        raise RuntimeError("All AAER URLs failed — SEC site may be restructured")
+
     soup = BeautifulSoup(r.text, "html.parser")
 
     entries = []
@@ -281,17 +297,49 @@ def build_fraud_labels(use_cache: bool = True) -> pd.DataFrame:
         logger.info(f"  {len(df)} fraud companies loaded")
         return df
 
-    logger.info("=== Building fraud label dataset from SEC AAERs ===")
+    logger.info("=== Building fraud label dataset ===")
 
-    # Step 1: Get the AAER index
-    index_entries = scrape_aaer_index()
+    # ── Priority 1: Academic dataset (Dechow et al. 2011) ────────────────────
+    # Cleaner labels, peer-reviewed, hosted on GitHub — more reliable than scraping
+    academic = load_supplemental_aaer_dataset()
+    if not academic.empty and "cik" in academic.columns and "is_fraud" in academic.columns:
+        logger.info(f"Academic dataset loaded: {len(academic)} rows, "
+                    f"{academic.get('is_fraud', pd.Series()).sum()} fraud firm-years")
 
-    # Step 2 & 3: Parse each entry
+        # Convert to the same schema as our scraped labels
+        fraud_rows = academic[academic.get("is_fraud", 0) == 1].copy()
+        if "year" in fraud_rows.columns:
+            # Create a fraud_date from year (use year-end as proxy)
+            fraud_rows["fraud_date"] = pd.to_datetime(
+                fraud_rows["year"].astype(str) + "-12-31"
+            )
+        fraud_rows["cik"] = fraud_rows["cik"].astype(str).str.zfill(10)
+        fraud_rows["match_score"] = 100.0
+        fraud_rows["aaer_no"]     = fraud_rows.get("aaer_no", pd.Series(dtype=int))
+        fraud_rows["ticker"]       = fraud_rows.get("ticker", "")
+        fraud_rows["company_name"] = fraud_rows.get("company_name", "")
+
+        keep = ["cik", "ticker", "company_name", "aaer_no", "fraud_date", "match_score"]
+        available = [c for c in keep if c in fraud_rows.columns]
+        result_df = fraud_rows[available].drop_duplicates("cik").reset_index(drop=True)
+        result_df.to_csv(cache_path, index=False)
+        logger.info(f"Saved {len(result_df)} fraud companies → {cache_path}")
+        return result_df
+
+    # ── Priority 2: Scrape SEC AAER pages ────────────────────────────────────
+    logger.info("Academic dataset unavailable — scraping SEC AAER pages…")
+    try:
+        index_entries = scrape_aaer_index()
+    except RuntimeError as e:
+        logger.error(f"AAER scraping failed: {e}")
+        logger.warning("Returning empty fraud labels — model will train on distress only")
+        return pd.DataFrame(columns=["cik", "ticker", "company_name",
+                                     "aaer_no", "fraud_date", "match_score"])
+
     parsed: list[dict] = []
     seen_aaer_nos: set = set()
 
     for entry in tqdm(index_entries, desc="Parsing AAER entries"):
-        # Some entries have enough text inline, others need detail page fetch
         result = parse_aaer_text(entry["raw_text"], entry.get("url", ""))
         if result is None and entry.get("url"):
             time.sleep(SLEEP)
@@ -307,19 +355,14 @@ def build_fraud_labels(use_cache: bool = True) -> pd.DataFrame:
     logger.info(f"Parsed {len(parsed)} AAER entries")
 
     if not parsed:
-        logger.warning("No AAER entries parsed. Check SEC website structure.")
-        # Return empty but valid DataFrame
+        logger.warning("No AAER entries parsed — returning empty fraud labels")
         return pd.DataFrame(columns=["cik", "ticker", "company_name",
                                      "aaer_no", "fraud_date", "match_score"])
 
-    # Step 4: Match to EDGAR
     matched_df = match_to_edgar(parsed)
     logger.info(f"Matched {len(matched_df)} companies to EDGAR CIKs")
-
-    # Step 5: Save
     matched_df.to_csv(cache_path, index=False)
     logger.info(f"Saved → {cache_path}")
-
     return matched_df
 
 
