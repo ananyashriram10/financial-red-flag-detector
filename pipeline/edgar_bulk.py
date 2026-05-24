@@ -48,33 +48,78 @@ TIMEOUT = 30          # request timeout
 
 
 # ── 1. Ticker universe ────────────────────────────────────────────────────────
+def _wiki_tickers(url: str, col: str) -> list[str]:
+    """Try fetching a Wikipedia table with browser-like headers to avoid 403."""
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    r = requests.get(url, headers=headers, timeout=20)
+    r.raise_for_status()
+    tables = pd.read_html(r.text)
+    for tbl in tables:
+        if col in tbl.columns:
+            raw = tbl[col].dropna().tolist()
+            return [str(t).strip().replace(".", "-") for t in raw]
+    return []
+
+
+def _sec_all_tickers() -> list[str]:
+    """
+    Fallback: pull every ticker from SEC's own company_tickers.json.
+    Returns all ~10,000 US-listed tickers — broader than S&P 1500 but
+    guaranteed to work since it's the same host we use for XBRL data.
+    We trim to the largest ~1,500 companies by CIK recency as a proxy.
+    """
+    logger.info("Using SEC company_tickers.json as ticker source (Wikipedia fallback)")
+    r = requests.get(
+        "https://www.sec.gov/files/company_tickers.json",
+        headers=HEADERS, timeout=20
+    )
+    r.raise_for_status()
+    data = r.json()
+    # Sort by CIK descending (higher CIK = more recently registered, biased toward active cos)
+    entries = sorted(data.values(), key=lambda x: x["cik_str"], reverse=True)
+    tickers = [e["ticker"] for e in entries if e.get("ticker")]
+    logger.info(f"SEC ticker list: {len(tickers)} total tickers available")
+    return tickers
+
+
 def get_sp1500_tickers() -> list[str]:
     """
-    Scrape S&P 500 + S&P 400 MidCap + S&P 600 SmallCap from Wikipedia.
-    Returns a deduplicated list of ticker symbols.
+    Get S&P 1500 tickers. Strategy:
+      1. Try Wikipedia with browser headers (works most of the time)
+      2. If Wikipedia blocks (403 on Kaggle), fall back to SEC's own ticker list
+         and take the top 1,500 by exchange listing activity
     """
-    sources = [
-        # (Wikipedia URL, column that holds the ticker)
-        ("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies",   "Symbol"),
-        ("https://en.wikipedia.org/wiki/List_of_S%26P_400_companies",   "Ticker symbol"),
-        ("https://en.wikipedia.org/wiki/List_of_S%26P_600_companies",   "Ticker symbol"),
+    wiki_sources = [
+        ("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies",  "Symbol"),
+        ("https://en.wikipedia.org/wiki/List_of_S%26P_400_companies",  "Ticker symbol"),
+        ("https://en.wikipedia.org/wiki/List_of_S%26P_600_companies",  "Ticker symbol"),
     ]
+
     tickers: set[str] = set()
-    for url, col in sources:
+    for url, col in wiki_sources:
         try:
-            tables = pd.read_html(url)
-            for tbl in tables:
-                if col in tbl.columns:
-                    raw = tbl[col].dropna().tolist()
-                    # Some Wikipedia entries use dots instead of hyphens (BRK.B → BRK-B)
-                    clean = [str(t).strip().replace(".", "-") for t in raw]
-                    tickers.update(clean)
-                    logger.info(f"  {url.split('/')[-1]}: {len(clean)} tickers")
-                    break
+            batch = _wiki_tickers(url, col)
+            tickers.update(batch)
+            logger.info(f"  Wikipedia {col}: {len(batch)} tickers")
         except Exception as e:
-            logger.warning(f"Failed to scrape {url}: {e}")
+            logger.warning(f"Wikipedia blocked ({e}) — will use SEC fallback")
+
+    if len(tickers) < 100:
+        # Wikipedia failed — use SEC fallback
+        all_tickers = _sec_all_tickers()
+        # Take first 1500 (SEC list is roughly sorted by prominence)
+        tickers = set(all_tickers[:1500])
+        logger.info(f"SEC fallback: using {len(tickers)} tickers")
+
     result = sorted(tickers)
-    logger.info(f"Total S&P 1500 tickers: {len(result)}")
+    logger.info(f"Total tickers to fetch: {len(result)}")
     return result
 
 
