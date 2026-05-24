@@ -500,33 +500,44 @@ def _edgar_company_search(name: str, window_year: int,
     Resolve a company name to its EDGAR CIK.
 
     Strategy 1 — Exact ticker lookup from pre-loaded SEC master list.
-      Fast and unambiguous. Works for any company ever filed with the SEC,
-      including delisted ones (company_tickers.json is historical, not live).
+      Fast, O(1), no HTTP.  After lookup we name-validate the result
+      (rapidfuzz ≥ 60) to catch ticker reuse: e.g. ticker CC belonged to
+      Circuit City but now maps to Chemours; ACI was Arch Coal, now
+      Albertsons.  If the name doesn't match we fall through to Strategy 2.
 
     Strategy 2 — EDGAR company-name search (browse-edgar).
-      For companies without a known ticker. Searches SEC's own index,
-      then validates the top result with TWO checks:
-        a) Name similarity: rapidfuzz token_sort_ratio > 55 between the
-           search term and the returned company name. Prevents accepting
-           "Icon Energy Corp" when we searched "Iconix Brand Group".
-        b) Has annual filings: the matching CIK must have at least one
-           10-K in its submission history (proves it's a real SEC filer,
-           not a shell). We no longer require overlap with the specific
-           fraud/bankruptcy window because the submissions API "recent"
-           field only covers ~40 latest filings, which for companies active
-           in 2009–2014 may not include that era.
+      Searches SEC's own index and validates the top candidate with TWO
+      checks:
+        a) Name similarity ≥ 65 (token_sort_ratio) after stripping EDGAR
+           noise — SIC-code suffixes ("SIC:3533- OIL & GAS…") and entity-
+           state tags ("/NEW/", "/DE/") that EDGAR appends to some names and
+           that would otherwise dilute the score for legitimate matches like
+           "WEATHERFORD INTERNATIONAL LLC /NEW/SIC:3533-…".
+        b) Has ≥1 10-K filing in EDGAR submissions history.
 
     Returns dict(cik, company_name, ticker) or None.
     """
-    # ── Strategy 1: ticker lookup (O(1), no HTTP needed if master is cached) ──
+    # ── Strategy 1: ticker lookup ──────────────────────────────────────────────
     if ticker:
         m = (master or {}).get(ticker.upper())
         if m:
-            logger.debug(f"  Ticker hit: {ticker} → {m['company_name']} ({m['cik']})")
-            return m
-        logger.debug(f"  Ticker {ticker!r} not in master list — falling through to search")
+            # Validate name before accepting — tickers get reassigned when a
+            # company delists and a new company takes the same symbol.
+            sim = _name_similarity(name, m["company_name"])
+            if sim >= 60:
+                logger.debug(
+                    f"  Ticker hit: {ticker} → {m['company_name']} "
+                    f"({m['cik']}) [sim={sim:.0f}]"
+                )
+                return m
+            logger.debug(
+                f"  Ticker {ticker!r} → {m['company_name']!r} rejected "
+                f"(name sim {sim:.0f} < 60 — likely ticker reuse) — trying name search"
+            )
+        else:
+            logger.debug(f"  Ticker {ticker!r} not in master list — falling through to search")
 
-    # ── Strategy 2: EDGAR company-name search ────────────────────────────────
+    # ── Strategy 2: EDGAR company-name search ─────────────────────────────────
     search_url = (
         "https://www.sec.gov/cgi-bin/browse-edgar"
         f"?company={requests.utils.quote(name)}"
@@ -552,10 +563,20 @@ def _edgar_company_search(name: str, window_year: int,
                 continue
             cik = cik_raw.zfill(10)
 
-            # ── a) Name similarity gate ───────────────────────────────────────
-            sim = _name_similarity(name, cand_name)
-            if sim < 55:
-                logger.debug(f"  Name sim {sim:.0f} < 55 — skip {cand_name!r}")
+            # ── Clean EDGAR noise before similarity check ─────────────────────
+            # EDGAR appends SIC codes and state/status suffixes to some entries:
+            #   "WEATHERFORD INTERNATIONAL LLC /NEW/SIC:3533- OIL & GAS FILED…"
+            # Strip those so the core company name gets a fair similarity score.
+            cand_clean = re.sub(r"\s*SIC:\d+.*$", "", cand_name, flags=re.IGNORECASE)
+            cand_clean = re.sub(r"\s*/[^/]+/", " ", cand_clean).strip()
+
+            # ── a) Name similarity gate (threshold raised 55 → 65) ───────────
+            sim = _name_similarity(name, cand_clean)
+            if sim < 65:
+                logger.debug(
+                    f"  Name sim {sim:.0f} < 65 — skip {cand_name!r} "
+                    f"(cleaned: {cand_clean!r})"
+                )
                 continue
 
             # ── b) Confirm it has ≥1 10-K filing in EDGAR submissions ─────────
@@ -565,7 +586,11 @@ def _edgar_company_search(name: str, window_year: int,
                 forms = subs.get("filings", {}).get("recent", {}).get("form", [])
                 has_10k = any(f.startswith("10-K") for f in forms)
                 if has_10k:
-                    return {"cik": cik, "company_name": cand_name, "ticker": ""}
+                    return {
+                        "cik":          cik,
+                        "company_name": cand_clean,   # cleaned name, not raw
+                        "ticker":       "",
+                    }
             except Exception:
                 pass
             time.sleep(SLEEP)
