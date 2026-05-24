@@ -399,9 +399,35 @@ class BaseRiskModel(ABC):
                             if mask.sum() > 0 else None,
         }
 
+        # OOF Recall@5% and Precision@20
+        # These are computed on the full pooled OOF predictions (all folds
+        # combined), not on the small held-out test set.  With ~30k rows and
+        # multiple folds the OOF pool typically contains 35-60 positive cases
+        # for the fraud model vs only ~12 in the test set, making these
+        # numbers far more stable and reliable than test-set recall.
+        oof_s = oof_scores[mask]
+        oof_l = oof_labels[mask]
+        if mask.sum() > 0 and oof_l.sum() > 0:
+            # Recall @ top 5%
+            thr = np.percentile(oof_s, 95)
+            flagged = oof_s >= thr
+            oof_recall_5 = float(oof_l[flagged].sum() / oof_l.sum())
+
+            # Precision @ top 20
+            top20_idx = np.argsort(-oof_s)[:20]
+            oof_prec_20 = float(oof_l[top20_idx].sum()) / 20.0
+
+            result["oof_recall_at_5pct"]  = round(oof_recall_5, 4)
+            result["oof_precision_at_20"] = round(oof_prec_20,  4)
+        else:
+            result["oof_recall_at_5pct"]  = None
+            result["oof_precision_at_20"] = None
+
         logger.info(f"\n[{self.model_name}] Walk-forward results:")
-        logger.info(f"  OOF AUC-ROC : {result['oof_auc_roc']}")
-        logger.info(f"  OOF AUC-PR  : {result['oof_auc_pr']}")
+        logger.info(f"  OOF AUC-ROC      : {result['oof_auc_roc']}")
+        logger.info(f"  OOF AUC-PR       : {result['oof_auc_pr']}")
+        logger.info(f"  OOF Recall@5%    : {result['oof_recall_at_5pct']}")
+        logger.info(f"  OOF Precision@20 : {result['oof_precision_at_20']}")
         if not fold_metrics:
             return result
         fdf = result["fold_metrics"]

@@ -103,22 +103,29 @@ def beneish_risk_score(df: pd.DataFrame) -> pd.Series:
 
 # ── Benchmark evaluation ──────────────────────────────────────────────────────
 def benchmark(
-    test_df:    pd.DataFrame,
-    our_scores: pd.Series | None = None,
-    task:       str = "fraud",          # "fraud" or "distress"
+    test_df:          pd.DataFrame,
+    our_scores:       pd.Series | None = None,
+    task:             str = "fraud",        # "fraud" or "distress"
+    oof_recall_5pct:  float | None = None,  # from walk_forward_evaluate()
+    oof_precision_20: float | None = None,  # from walk_forward_evaluate()
 ) -> pd.DataFrame:
     """
     Evaluate Altman, Beneish, and (optionally) our model on the same test set.
 
     Parameters
     ----------
-    test_df     : feature DataFrame with label columns
-    our_scores  : our ensemble scores (Series aligned with test_df index)
-    task        : "fraud" → use is_fraud label; "distress" → use is_bankrupt
+    test_df          : feature DataFrame with label columns
+    our_scores       : our ensemble scores (Series aligned with test_df index)
+    task             : "fraud" → use is_fraud label; "distress" → use is_bankrupt
+    oof_recall_5pct  : OOF Recall@5% from walk_forward_evaluate() for our model.
+                       Baselines don't do CV so this is None for them.
+    oof_precision_20 : OOF Precision@20 from walk_forward_evaluate().
 
     Returns
     -------
-    DataFrame with columns [model, auc_roc, auc_pr, recall_at_5pct]
+    DataFrame with columns [model, auc_roc, auc_pr, recall_at_5pct,
+                            precision_at_20, oof_recall_at_5pct,
+                            oof_precision_at_20, n_test, n_positive]
     """
     label_col = "is_fraud" if task == "fraud" else "is_bankrupt"
     assert label_col in test_df.columns, f"'{label_col}' column missing"
@@ -131,44 +138,61 @@ def benchmark(
 
     rows = []
 
-    def _eval(name: str, scores: pd.Series) -> dict:
+    def _eval(name: str, scores: pd.Series,
+              oof_recall_5: float | None = None,
+              oof_prec_20:  float | None = None) -> dict:
         scores = scores.fillna(scores.median())
         # Handle constant score edge case
         if scores.nunique() == 1:
             return {"model": name, "auc_roc": 0.5, "auc_pr": float(y.mean()),
-                    "recall_at_5pct": np.nan}
+                    "recall_at_5pct": np.nan, "precision_at_20": np.nan}
 
         auc_roc = roc_auc_score(y, scores)
         auc_pr  = average_precision_score(y, scores)
 
-        # Recall @ top 5% flagged
+        # Recall @ top 5% of rows  (test-set, noisy when n_positive is small)
         threshold = scores.quantile(0.95)
         flagged   = (scores >= threshold)
         recall_5  = (y[flagged].sum() / y.sum()) if y.sum() > 0 else np.nan
 
+        # Precision @ top 20 flagged companies
+        # "Of the 20 companies we are most confident about, how many are real?"
+        # Fixed K avoids the percentage-cutoff sensitivity.
+        top20_idx  = scores.nlargest(20).index
+        prec_20    = float(y[top20_idx].sum()) / 20.0
+
         return {
-            "model":          name,
-            "auc_roc":        round(auc_roc, 4),
-            "auc_pr":         round(auc_pr,  4),
-            "recall_at_5pct": round(recall_5, 4),
-            "n_test":         len(y),
-            "n_positive":     int(y.sum()),
-            "positive_rate":  round(float(y.mean()), 4),
+            "model":              name,
+            "auc_roc":            round(auc_roc,   4),
+            "auc_pr":             round(auc_pr,    4),
+            # test-set recall (kept for baselines; our model uses OOF below)
+            "recall_at_5pct":     round(recall_5,  4),
+            # fixed-K precision — more interpretable, same test set for all
+            "precision_at_20":    round(prec_20,   4),
+            # OOF metrics for our model (None for baselines, which have no CV)
+            "oof_recall_at_5pct":  round(oof_recall_5, 4) if oof_recall_5 is not None else None,
+            "oof_precision_at_20": round(oof_prec_20,  4) if oof_prec_20  is not None else None,
+            "n_test":             len(y),
+            "n_positive":         int(y.sum()),
+            "positive_rate":      round(float(y.mean()), 4),
         }
 
-    rows.append(_eval("Altman Z-Score",   altman_risk_score(test_df)))
-    rows.append(_eval("Beneish M-Score",  beneish_risk_score(test_df)))
+    rows.append(_eval("Altman Z-Score",  altman_risk_score(test_df)))
+    rows.append(_eval("Beneish M-Score", beneish_risk_score(test_df)))
 
     if our_scores is not None:
         label = "Our Model (XGB + IsoForest)"
-        rows.append(_eval(label, our_scores))
+        rows.append(_eval(label, our_scores,
+                          oof_recall_5=oof_recall_5pct,
+                          oof_prec_20=oof_precision_20))
 
     result = pd.DataFrame(rows).set_index("model")
 
     logger.info(f"\n{'='*55}")
     logger.info(f"BENCHMARK RESULTS — Task: {task.upper()}")
     logger.info(f"{'='*55}")
-    logger.info(result[["auc_roc", "auc_pr", "recall_at_5pct"]].to_string())
+    show_cols = ["auc_roc", "auc_pr", "precision_at_20", "recall_at_5pct"]
+    logger.info(result[show_cols].to_string())
 
     return result
 

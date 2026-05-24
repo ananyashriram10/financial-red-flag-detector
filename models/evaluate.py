@@ -87,17 +87,21 @@ def run_evaluation(
     logger.info("\n=== Walk-Forward CV: Fraud Model ===")
     fraud_cv = fraud_model.walk_forward_evaluate(labeled_df)
     results["fraud_cv"] = {
-        "oof_auc_roc": fraud_cv.get("oof_auc_roc"),
-        "oof_auc_pr":  fraud_cv.get("oof_auc_pr"),
-        "folds":       fraud_cv.get("fold_metrics", pd.DataFrame()).to_dict("records"),
+        "oof_auc_roc":         fraud_cv.get("oof_auc_roc"),
+        "oof_auc_pr":          fraud_cv.get("oof_auc_pr"),
+        "oof_recall_at_5pct":  fraud_cv.get("oof_recall_at_5pct"),
+        "oof_precision_at_20": fraud_cv.get("oof_precision_at_20"),
+        "folds":               fraud_cv.get("fold_metrics", pd.DataFrame()).to_dict("records"),
     }
 
     logger.info("\n=== Walk-Forward CV: Distress Model ===")
     distress_cv = distress_model.walk_forward_evaluate(labeled_df)
     results["distress_cv"] = {
-        "oof_auc_roc": distress_cv.get("oof_auc_roc"),
-        "oof_auc_pr":  distress_cv.get("oof_auc_pr"),
-        "folds":       distress_cv.get("fold_metrics", pd.DataFrame()).to_dict("records"),
+        "oof_auc_roc":         distress_cv.get("oof_auc_roc"),
+        "oof_auc_pr":          distress_cv.get("oof_auc_pr"),
+        "oof_recall_at_5pct":  distress_cv.get("oof_recall_at_5pct"),
+        "oof_precision_at_20": distress_cv.get("oof_precision_at_20"),
+        "folds":               distress_cv.get("fold_metrics", pd.DataFrame()).to_dict("records"),
     }
 
     # ── 2. Get model predictions on test set ──────────────────────────────────
@@ -108,11 +112,21 @@ def run_evaluation(
     distress_scores= distress_preds["score"]
 
     # ── 3. Benchmark vs Altman + Beneish ──────────────────────────────────────
+    # OOF recall/precision passed in so our model's row in the table can show
+    # the stable cross-validated numbers alongside the test-set AUC metrics.
     logger.info("\n=== Benchmark: Fraud Task ===")
-    fraud_bench = benchmark(test_df, fraud_scores, task="fraud")
+    fraud_bench = benchmark(
+        test_df, fraud_scores, task="fraud",
+        oof_recall_5pct  = results["fraud_cv"].get("oof_recall_at_5pct"),
+        oof_precision_20 = results["fraud_cv"].get("oof_precision_at_20"),
+    )
 
     logger.info("\n=== Benchmark: Distress Task ===")
-    distress_bench = benchmark(test_df, distress_scores, task="distress")
+    distress_bench = benchmark(
+        test_df, distress_scores, task="distress",
+        oof_recall_5pct  = results["distress_cv"].get("oof_recall_at_5pct"),
+        oof_precision_20 = results["distress_cv"].get("oof_precision_at_20"),
+    )
 
     results["fraud_benchmark"]   = fraud_bench.reset_index().to_dict("records")
     results["distress_benchmark"]= distress_bench.reset_index().to_dict("records")
@@ -163,32 +177,74 @@ def _shap_importance(model, df: pd.DataFrame, n: int = 20) -> list[dict]:
 
 
 def _print_summary(results: dict):
-    print("\n" + "═"*60)
+    W = 72
+    print("\n" + "═"*W)
     print("  MODEL BENCHMARK SUMMARY")
-    print("═"*60)
+    print("═"*W)
 
+    # ── Section 1: Benchmark table (same test set for all models) ─────────────
+    # Precision@20 = "of the 20 companies we flagged most confidently,
+    #                 how many are genuine fraud/distress?"
+    # Fixed K means this is comparable across models without the n_positive
+    # sensitivity that makes Recall@5% noisy on small test sets.
+    #
+    # For OUR model the table also shows OOF Recall@5% (from walk-forward CV,
+    # pooling 35-60 positives across all folds) — far more stable than the
+    # test-set number which is based on only ~12 positives.
+    # Baselines have no CV so their OOF column is blank.
     for task in ["fraud", "distress"]:
         bench = results.get(f"{task}_benchmark", [])
         if not bench:
             continue
-        print(f"\n  {task.upper()} DETECTION")
-        print(f"  {'Model':<35} {'AUC-ROC':>8} {'AUC-PR':>8} {'Recall@5%':>10}")
-        print(f"  {'─'*35} {'─'*8} {'─'*8} {'─'*10}")
+        print(f"\n  ── {task.upper()} DETECTION ──")
+        hdr = (f"  {'Model':<35} {'AUC-ROC':>8} {'AUC-PR':>8} "
+               f"{'P@20':>6} {'R@5%*':>7} {'OOF R@5%':>9}")
+        print(hdr)
+        print("  " + "─"*(len(hdr)-2))
         for row in bench:
-            marker = " ◀" if "Our Model" in str(row.get("model", "")) else ""
-            print(f"  {str(row.get('model','')):<35} "
-                  f"{row.get('auc_roc', 0):>8.4f} "
-                  f"{row.get('auc_pr',  0):>8.4f} "
-                  f"{row.get('recall_at_5pct', 0):>10.4f}{marker}")
+            is_ours = "Our Model" in str(row.get("model", ""))
+            marker  = " ◀" if is_ours else ""
 
-    cv_f = results.get("fraud_cv", {})
+            # OOF recall — available for our model, blank for baselines
+            oof_r = row.get("oof_recall_at_5pct")
+            oof_r_str = f"{oof_r:>9.4f}" if oof_r is not None else f"{'—':>9}"
+
+            print(
+                f"  {str(row.get('model','')):<35} "
+                f"{row.get('auc_roc',      0):>8.4f} "
+                f"{row.get('auc_pr',       0):>8.4f} "
+                f"{row.get('precision_at_20', 0):>6.4f} "
+                f"{row.get('recall_at_5pct',  0):>7.4f} "
+                f"{oof_r_str}{marker}"
+            )
+        n_pos = bench[0].get("n_positive", "?") if bench else "?"
+        n_tot = bench[0].get("n_test",     "?") if bench else "?"
+        print(f"  * test-set Recall@5% (n_positive={n_pos}, n_test={n_tot} — "
+              f"noisy; use OOF R@5% for our model)")
+
+    # ── Section 2: Walk-forward CV summary (our models only) ──────────────────
+    # These numbers use ALL folds pooled (35-60 positives for fraud model)
+    # so they are the trustworthy headline metrics for our models.
+    cv_f = results.get("fraud_cv",    {})
     cv_d = results.get("distress_cv", {})
-    print(f"\n  WALK-FORWARD CV (out-of-fold)")
-    print(f"  Fraud model    — AUC-ROC: {cv_f.get('oof_auc_roc','N/A')}  "
-          f"AUC-PR: {cv_f.get('oof_auc_pr','N/A')}")
-    print(f"  Distress model — AUC-ROC: {cv_d.get('oof_auc_roc','N/A')}  "
-          f"AUC-PR: {cv_d.get('oof_auc_pr','N/A')}")
-    print("═"*60)
+
+    def _fmt(v):
+        return f"{v:.4f}" if isinstance(v, float) else str(v) if v is not None else "N/A"
+
+    print(f"\n  ── WALK-FORWARD CV — OUT-OF-FOLD (pooled across all folds) ──")
+    print(f"  {'':30} {'AUC-ROC':>8} {'AUC-PR':>8} {'Recall@5%':>10} {'Prec@20':>8}")
+    print(f"  {'─'*30} {'─'*8} {'─'*8} {'─'*10} {'─'*8}")
+    print(f"  {'Fraud model':<30} "
+          f"{_fmt(cv_f.get('oof_auc_roc')):>8} "
+          f"{_fmt(cv_f.get('oof_auc_pr')):>8} "
+          f"{_fmt(cv_f.get('oof_recall_at_5pct')):>10} "
+          f"{_fmt(cv_f.get('oof_precision_at_20')):>8}")
+    print(f"  {'Distress model':<30} "
+          f"{_fmt(cv_d.get('oof_auc_roc')):>8} "
+          f"{_fmt(cv_d.get('oof_auc_pr')):>8} "
+          f"{_fmt(cv_d.get('oof_recall_at_5pct')):>10} "
+          f"{_fmt(cv_d.get('oof_precision_at_20')):>8}")
+    print("═"*W)
 
 
 def _json_safe(obj):
