@@ -375,6 +375,82 @@ def build_raw_table(
     return result
 
 
+# ── 6. Augment dataset with fraud company EDGAR data ─────────────────────────
+def augment_with_fraud_companies(
+    raw_df:     pd.DataFrame,
+    fraud_ciks: list[str],
+    min_years:  int = 2,
+) -> pd.DataFrame:
+    """
+    For each fraud company CIK that is NOT already in raw_df,
+    fetch its EDGAR data and append it.
+
+    This is necessary because fraud companies (Nikola, Enron etc.)
+    are often not in the S&P 500/1500 universe we fetch by default.
+    Without their financial data, we can't train the fraud model.
+
+    Parameters
+    ----------
+    raw_df     : existing raw financials DataFrame
+    fraud_ciks : list of zero-padded CIK strings from fraud labels
+    min_years  : minimum years of data needed (lower than main pipeline
+                 since some fraud companies filed for fewer years)
+
+    Returns
+    -------
+    Augmented raw_df with fraud company rows appended.
+    """
+    existing_ciks = set(raw_df["cik"].astype(str).unique())
+    missing       = [c for c in fraud_ciks if str(c) not in existing_ciks]
+
+    if not missing:
+        logger.info("All fraud company CIKs already in dataset — no augmentation needed")
+        return raw_df
+
+    logger.info(f"Fetching EDGAR data for {len(missing)} fraud companies "
+                f"not in current dataset...")
+
+    cik_map        = load_cik_map()
+    cik_to_ticker  = {v: k for k, v in cik_map.items()}
+    extra_rows: list[pd.DataFrame] = []
+    fetched, failed = 0, 0
+
+    for cik in tqdm(missing, desc="Augmenting fraud companies", unit="co"):
+        facts = fetch_company_facts(cik)
+        if facts is None:
+            failed += 1
+            continue
+
+        df = extract_raw_financials(cik, facts)
+        if df.empty or df["year"].nunique() < min_years:
+            failed += 1
+            continue
+
+        company_name   = facts.get("entityName", f"CIK_{cik}")
+        ticker         = cik_to_ticker.get(cik, "")
+        df["ticker"]       = ticker
+        df["company_name"] = company_name
+        extra_rows.append(df)
+        fetched += 1
+        time.sleep(SLEEP)
+
+    logger.info(f"Augmentation: fetched={fetched}, failed={failed}")
+
+    if not extra_rows:
+        logger.warning("No fraud company data could be fetched — "
+                       "they may be too old for EDGAR XBRL")
+        return raw_df
+
+    augmented = pd.concat([raw_df] + extra_rows, ignore_index=True)
+
+    # Overwrite the cached parquet
+    out = ROOT / "data" / "processed" / "raw_financials.parquet"
+    augmented.to_parquet(out, index=False)
+    logger.info(f"Augmented dataset saved → {out}  "
+                f"({len(raw_df):,} → {len(augmented):,} rows)")
+    return augmented
+
+
 # ── CLI convenience ───────────────────────────────────────────────────────────
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO,
