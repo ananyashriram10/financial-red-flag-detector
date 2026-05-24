@@ -88,61 +88,79 @@ def attach_fraud_labels(feat_df: pd.DataFrame,
 
 
 # ── Bankruptcy labels ──────────────────────────────────────────────────────────
-def attach_bankruptcy_labels(feat_df: pd.DataFrame) -> pd.DataFrame:
+def attach_bankruptcy_labels(feat_df: pd.DataFrame,
+                             bk_df: pd.DataFrame | None = None) -> pd.DataFrame:
     """
-    Proxy bankruptcy detection: companies that stopped filing 10-Ks
-    AND showed financial distress before going dark.
+    Mark company-years as pre-bankruptcy distress using Chapter 11 filing dates.
 
-    Logic:
-    1. Find max filing year per company
-    2. If max year < (overall_max_year - 2) → company went dark
-    3. Check if Altman Z-score components suggest distress
-    4. Flag 2 years before they went dark as 'bankrupt'
+    If bk_df is provided (from get_bankruptcy_labels()), it is used directly.
+    Falls back to a filing-gap heuristic if bk_df is None or empty.
 
-    This is a heuristic — not as clean as AAER fraud labels.
-    For a production system, cross-reference with PACER or UCLA-LoPucki.
+    bk_df columns: [cik, bankruptcy_date]
+
+    A (cik, year) is bankrupt if:
+      bankruptcy_year - 2 <= year <= bankruptcy_year - 1
+    (The 2 fiscal years BEFORE the Ch.11 filing show clear distress signals
+     while the company was still filing annual reports.)
     """
     feat_df = feat_df.copy()
+    feat_df["cik"] = feat_df["cik"].astype(str).str.zfill(10)
 
+    # ── Path A: real labels from KNOWN_BANKRUPTCY_SEED ───────────────────────
+    if bk_df is not None and not bk_df.empty:
+        bk_df = bk_df[["cik", "bankruptcy_date"]].dropna().copy()
+        bk_df["bk_year"] = pd.to_datetime(bk_df["bankruptcy_date"]).dt.year
+        bk_df["cik"]     = bk_df["cik"].astype(str).str.zfill(10)
+
+        bk_ranges = []
+        for _, row in bk_df.iterrows():
+            by = int(row["bk_year"])
+            for yr in range(by - 2, by):      # 2 years before filing
+                bk_ranges.append({"cik": row["cik"], "year": yr, "is_bankrupt": 1})
+
+        if bk_ranges:
+            bk_year_df = pd.DataFrame(bk_ranges).drop_duplicates()
+            feat_df = feat_df.merge(bk_year_df, on=["cik", "year"], how="left")
+            feat_df["is_bankrupt"] = feat_df["is_bankrupt"].fillna(0).astype(int)
+            n_bk = feat_df["is_bankrupt"].sum()
+            logger.info(f"Bankruptcy labels (real): {n_bk:,} company-years flagged")
+            return feat_df
+
+    # ── Path B: heuristic fallback (gone-dark + distress signals) ────────────
+    logger.warning("No real bankruptcy labels — falling back to filing-gap heuristic")
     overall_max_year = feat_df["year"].max()
     max_year_per_co  = feat_df.groupby("cik")["year"].max().reset_index()
     max_year_per_co.columns = ["cik", "last_filing_year"]
 
-    # Companies whose last filing is ≥ 3 years before dataset ends
     gone_dark = max_year_per_co[
         max_year_per_co["last_filing_year"] <= overall_max_year - 3
     ]["cik"].tolist()
-
     logger.info(f"Companies that stopped filing: {len(gone_dark)}")
 
-    # Among gone-dark companies, check for distress indicators in final years
     distressed_ciks = set()
     for cik in gone_dark:
-        co_data = feat_df[feat_df["cik"] == cik].sort_values("year")
+        co_data   = feat_df[feat_df["cik"] == cik].sort_values("year")
         last_rows = co_data.tail(2)
-
-        # Distress heuristic: multiple of these must be true in final 2 years
-        signals = 0
-        if "f_current_ratio"  in last_rows and (last_rows["f_current_ratio"] < 1.0).any():
-            signals += 1
-        if "f_debt_assets"    in last_rows and (last_rows["f_debt_assets"] > 0.8).any():
-            signals += 1
-        if "f_net_margin"     in last_rows and (last_rows["f_net_margin"] < 0).any():
-            signals += 1
-        if "f_cfo_ni"         in last_rows and (last_rows["f_cfo_ni"] < 0).any():
-            signals += 1
-        if "f_z_x1"           in last_rows and (last_rows["f_z_x1"] < 0).any():
-            signals += 1   # negative working capital
-
+        signals   = 0
+        for col, thresh, direction in [
+            ("f_current_ratio", 1.0,  "below"),
+            ("f_debt_assets",   0.8,  "above"),
+            ("f_net_margin",    0.0,  "below"),
+            ("f_cfo_ni",        0.0,  "below"),
+            ("f_z_x1",          0.0,  "below"),
+        ]:
+            if col in last_rows.columns:
+                hit = (last_rows[col] < thresh if direction == "below"
+                       else last_rows[col] > thresh)
+                if hit.any():
+                    signals += 1
         if signals >= 2:
             distressed_ciks.add(cik)
 
-    logger.info(f"Distressed + dark companies (bankruptcy proxy): {len(distressed_ciks)}")
-
-    # Mark final 2 years for distressed-gone-dark companies
+    logger.info(f"Distressed + dark companies: {len(distressed_ciks)}")
     bankrupt_rows = []
     for cik in distressed_ciks:
-        co_data = feat_df[feat_df["cik"] == cik]
+        co_data      = feat_df[feat_df["cik"] == cik]
         last_2_years = co_data["year"].nlargest(2).tolist()
         for yr in last_2_years:
             bankrupt_rows.append({"cik": cik, "year": yr, "is_bankrupt": 1})
@@ -151,12 +169,10 @@ def attach_bankruptcy_labels(feat_df: pd.DataFrame) -> pd.DataFrame:
         feat_df["is_bankrupt"] = 0
         return feat_df
 
-    bk_df = pd.DataFrame(bankrupt_rows).drop_duplicates()
-    feat_df = feat_df.merge(bk_df, on=["cik", "year"], how="left")
+    bk_year_df = pd.DataFrame(bankrupt_rows).drop_duplicates()
+    feat_df = feat_df.merge(bk_year_df, on=["cik", "year"], how="left")
     feat_df["is_bankrupt"] = feat_df["is_bankrupt"].fillna(0).astype(int)
-
-    n_bk = feat_df["is_bankrupt"].sum()
-    logger.info(f"Bankruptcy labels: {n_bk:,} company-years flagged")
+    logger.info(f"Bankruptcy labels (heuristic): {feat_df['is_bankrupt'].sum():,} company-years flagged")
     return feat_df
 
 
@@ -246,7 +262,23 @@ def build_labeled_dataset(
         logger.warning("No fraud labels found — all set to 0")
 
     # ── Bankruptcy labels ─────────────────────────────────────────
-    feat_df = attach_bankruptcy_labels(feat_df)
+    # Try to load real Ch.11 labels from the bankruptcy seed list
+    bk_df = None
+    try:
+        from pipeline.aaer_labels import get_bankruptcy_labels
+        bk_cache = LABELS_DIR / "bankruptcy_labels.csv"
+        if bk_cache.exists():
+            bk_df = pd.read_csv(bk_cache, parse_dates=["bankruptcy_date"])
+            logger.info(f"Loaded cached bankruptcy labels: {len(bk_df)} companies")
+        else:
+            bk_df = get_bankruptcy_labels()
+            if not bk_df.empty:
+                bk_df.to_csv(bk_cache, index=False)
+                logger.info(f"Saved bankruptcy labels → {bk_cache}")
+    except Exception as e:
+        logger.warning(f"Could not load bankruptcy labels: {e}")
+
+    feat_df = attach_bankruptcy_labels(feat_df, bk_df=bk_df)
 
     # ── Unified label ─────────────────────────────────────────────
     # 0 = clean, 1 = fraud, 2 = bankrupt

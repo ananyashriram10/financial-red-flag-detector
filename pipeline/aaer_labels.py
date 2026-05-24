@@ -457,40 +457,76 @@ KNOWN_FRAUD_SEED = [
 ]
 
 
-def _edgar_company_search(name: str, fraud_year: int,
-                          ticker: str | None = None) -> dict | None:
+def _load_sec_master() -> dict[str, dict]:
     """
-    Resolve a company name to its EDGAR CIK using two strategies:
-
-    1. Ticker lookup (exact, instant) — if ticker is supplied and found in the
-       SEC master list, use it directly.
-    2. EDGAR company search API — sends the name to SEC's own company-search
-       endpoint, returns the top result that has 10-K filings in the fraud
-       window [fraud_year-3, fraud_year].  No fuzzy matching against a flat list;
-       the SEC's search engine handles name variations.
-
-    Returns dict(cik, company_name, ticker) or None if unresolvable.
+    Load SEC company_tickers.json and return a dict keyed by UPPER ticker.
+    Cached as a module-level variable so it is fetched at most once per run.
     """
-    # ── Strategy 1: exact ticker lookup ──────────────────────────────────────
+    global _SEC_MASTER_BY_TICKER
+    if _SEC_MASTER_BY_TICKER is not None:
+        return _SEC_MASTER_BY_TICKER
+
+    r = requests.get("https://www.sec.gov/files/company_tickers.json",
+                     headers=HEADERS, timeout=30)
+    r.raise_for_status()
+    _SEC_MASTER_BY_TICKER = {
+        entry.get("ticker", "").upper(): {
+            "cik":          str(entry["cik_str"]).zfill(10),
+            "company_name": entry.get("title", ""),
+            "ticker":       entry.get("ticker", "").upper(),
+        }
+        for entry in r.json().values()
+        if entry.get("ticker")
+    }
+    logger.debug(f"SEC master list loaded: {len(_SEC_MASTER_BY_TICKER):,} tickers")
+    return _SEC_MASTER_BY_TICKER
+
+_SEC_MASTER_BY_TICKER: dict | None = None   # module-level cache
+
+
+def _name_similarity(a: str, b: str) -> float:
+    """Token-sort ratio between two company names (0–100). Handles None."""
+    try:
+        from rapidfuzz import fuzz
+        return fuzz.token_sort_ratio(_normalise(a), _normalise(b))
+    except Exception:
+        return 0.0
+
+
+def _edgar_company_search(name: str, window_year: int,
+                          ticker: str | None = None,
+                          master: dict | None = None) -> dict | None:
+    """
+    Resolve a company name to its EDGAR CIK.
+
+    Strategy 1 — Exact ticker lookup from pre-loaded SEC master list.
+      Fast and unambiguous. Works for any company ever filed with the SEC,
+      including delisted ones (company_tickers.json is historical, not live).
+
+    Strategy 2 — EDGAR company-name search (browse-edgar).
+      For companies without a known ticker. Searches SEC's own index,
+      then validates the top result with TWO checks:
+        a) Name similarity: rapidfuzz token_sort_ratio > 55 between the
+           search term and the returned company name. Prevents accepting
+           "Icon Energy Corp" when we searched "Iconix Brand Group".
+        b) Has annual filings: the matching CIK must have at least one
+           10-K in its submission history (proves it's a real SEC filer,
+           not a shell). We no longer require overlap with the specific
+           fraud/bankruptcy window because the submissions API "recent"
+           field only covers ~40 latest filings, which for companies active
+           in 2009–2014 may not include that era.
+
+    Returns dict(cik, company_name, ticker) or None.
+    """
+    # ── Strategy 1: ticker lookup (O(1), no HTTP needed if master is cached) ──
     if ticker:
-        try:
-            r = requests.get("https://www.sec.gov/files/company_tickers.json",
-                             headers=HEADERS, timeout=20)
-            r.raise_for_status()
-            for entry in r.json().values():
-                if entry.get("ticker", "").upper() == ticker.upper():
-                    return {
-                        "cik":          str(entry["cik_str"]).zfill(10),
-                        "company_name": entry.get("title", name),
-                        "ticker":       ticker.upper(),
-                    }
-        except Exception as e:
-            logger.debug(f"  Ticker lookup failed for {ticker}: {e}")
+        m = (master or {}).get(ticker.upper())
+        if m:
+            logger.debug(f"  Ticker hit: {ticker} → {m['company_name']} ({m['cik']})")
+            return m
+        logger.debug(f"  Ticker {ticker!r} not in master list — falling through to search")
 
-    # ── Strategy 2: EDGAR company-name search ─────────────────────────────────
-    # SEC's browse-edgar returns a ranked list of companies matching the name.
-    # We pick the first result whose submission history overlaps the fraud window.
-    window_years = set(range(fraud_year - 3, fraud_year + 1))
+    # ── Strategy 2: EDGAR company-name search ────────────────────────────────
     search_url = (
         "https://www.sec.gov/cgi-bin/browse-edgar"
         f"?company={requests.utils.quote(name)}"
@@ -506,26 +542,32 @@ def _edgar_company_search(name: str, fraud_year: int,
         if table is None:
             return None
 
-        for row in table.find_all("tr")[1:]:   # skip header row
+        for row in table.find_all("tr")[1:]:
             cells = row.find_all("td")
             if len(cells) < 2:
                 continue
-            cik_raw  = cells[0].get_text(strip=True)
+            cik_raw   = cells[0].get_text(strip=True)
             cand_name = cells[1].get_text(strip=True)
             if not cik_raw.isdigit():
                 continue
             cik = cik_raw.zfill(10)
 
-            # Validate: does this CIK have 10-K filings in the fraud window?
+            # ── a) Name similarity gate ───────────────────────────────────────
+            sim = _name_similarity(name, cand_name)
+            if sim < 55:
+                logger.debug(f"  Name sim {sim:.0f} < 55 — skip {cand_name!r}")
+                continue
+
+            # ── b) Confirm it has ≥1 10-K filing in EDGAR submissions ─────────
             subs_url = f"https://data.sec.gov/submissions/CIK{cik}.json"
             try:
-                subs = requests.get(subs_url, headers=HEADERS, timeout=15).json()
-                filing_dates = subs.get("filings", {}).get("recent", {}).get("filingDate", [])
-                filing_years = {int(d[:4]) for d in filing_dates}
-                if window_years & filing_years:          # overlap → right company
+                subs  = requests.get(subs_url, headers=HEADERS, timeout=15).json()
+                forms = subs.get("filings", {}).get("recent", {}).get("form", [])
+                has_10k = any(f.startswith("10-K") for f in forms)
+                if has_10k:
                     return {"cik": cik, "company_name": cand_name, "ticker": ""}
             except Exception:
-                pass   # skip this candidate, try next row
+                pass
             time.sleep(SLEEP)
 
     except Exception as e:
@@ -534,26 +576,25 @@ def _edgar_company_search(name: str, fraud_year: int,
     return None
 
 
-def get_seed_fraud_labels() -> pd.DataFrame:
+def _resolve_seed(seed: list[tuple], label_col: str,
+                  label_date_fn) -> pd.DataFrame:
     """
-    Build fraud labels from KNOWN_FRAUD_SEED by resolving each company to its
-    EDGAR CIK using ticker lookup → EDGAR company search → filing validation.
+    Generic resolver: given a seed list of (name, year, ticker) tuples,
+    resolve each entry to its EDGAR CIK and return a DataFrame.
 
-    No hardcoded CIKs.  No flat-list fuzzy matching.
-    fraud_date = end of fraud period so window [fraud_year-3 → fraud_year]
-    covers the years the fraud was actually occurring.
+    label_date_fn(year) → date string, e.g. lambda y: f"{y}-12-31"
     """
-    logger.info("Resolving fraud seed list via EDGAR company search…")
+    master = _load_sec_master()
     rows: list[dict] = []
     seen_ciks: set[str] = set()
 
-    for company_name, fraud_year, ticker in KNOWN_FRAUD_SEED:
-        info = _edgar_company_search(company_name, fraud_year, ticker)
+    for company_name, year, ticker in seed:
+        info = _edgar_company_search(company_name, year, ticker, master=master)
         if info is None:
             logger.warning(f"  Could not resolve: {company_name!r}")
             continue
         if info["cik"] in seen_ciks:
-            logger.debug(f"  Duplicate CIK skipped: {company_name} → {info['company_name']}")
+            logger.debug(f"  Duplicate skipped: {company_name} → {info['company_name']}")
             continue
 
         seen_ciks.add(info["cik"])
@@ -561,15 +602,99 @@ def get_seed_fraud_labels() -> pd.DataFrame:
             "cik":          info["cik"],
             "ticker":       info.get("ticker", ""),
             "company_name": info["company_name"],
-            "aaer_no":      None,
-            "fraud_date":   pd.Timestamp(f"{fraud_year}-12-31").date(),
-            "match_score":  100.0 if ticker else 95.0,
+            label_col:      pd.Timestamp(label_date_fn(year)).date(),
+            "match_score":  100.0 if ticker and info.get("ticker") else 90.0,
         })
         logger.info(f"  ✓ {company_name!r} → {info['company_name']!r}  CIK={info['cik']}")
         time.sleep(SLEEP)
 
-    df = pd.DataFrame(rows).drop_duplicates("cik")
+    return pd.DataFrame(rows).drop_duplicates("cik")
+
+
+def get_seed_fraud_labels() -> pd.DataFrame:
+    """
+    Resolve KNOWN_FRAUD_SEED → DataFrame[cik, company_name, fraud_date, …].
+
+    Uses ticker lookup first (fast, exact), then EDGAR name search with
+    name-similarity validation (prevents wrong-entity matches).
+    fraud_date = end of fraud period so labeler window covers actual fraud years.
+    """
+    logger.info(f"Resolving fraud seed list ({len(KNOWN_FRAUD_SEED)} entries)…")
+    df = _resolve_seed(
+        seed=KNOWN_FRAUD_SEED,
+        label_col="fraud_date",
+        label_date_fn=lambda y: f"{y}-12-31",
+    )
+    df["aaer_no"] = None
     logger.info(f"Seed fraud labels resolved: {len(df)} / {len(KNOWN_FRAUD_SEED)} companies")
+    return df
+
+
+# ── Bankruptcy seed: major US public company Ch.11 filings 2008-2023 ─────────
+# bankruptcy_year = year Chapter 11 was filed.
+# Labeler will mark [year-2, year-1] as is_bankrupt=1.
+# Only post-2006 so EDGAR XBRL data exists for the pre-bankruptcy years.
+KNOWN_BANKRUPTCY_SEED = [
+    # (company_name, ch11_filing_year, ticker_at_time_of_filing)
+    # ── 2008–2010: Financial-crisis wave ─────────────────────────────────────
+    ("Circuit City Stores",       2008, "CC"),
+    ("Tribune",                   2008, "TRB"),
+    ("Pilgrim's Pride",           2008, "PPC"),
+    ("General Motors",            2009, "GM"),
+    ("CIT Group",                 2009, "CIT"),
+    ("Six Flags",                 2009, "SIX"),
+    ("Charter Communications",    2009, "CHTR"),
+    ("Nortel Networks",           2009, "NT"),
+    ("Visteon",                   2009, "VC"),
+    # ── 2011–2014 ─────────────────────────────────────────────────────────────
+    ("Borders Group",             2011, "BGP"),
+    ("AMR Corporation",           2011, "AMR"),
+    ("Eastman Kodak",             2012, "EK"),
+    ("Hostess Brands",            2012, "HWIN"),
+    ("Energy Future Holdings",    2014, "EFH"),
+    # ── 2015–2017 ─────────────────────────────────────────────────────────────
+    ("RadioShack",                2015, "RSH"),
+    ("Alpha Natural Resources",   2015, "ANR"),
+    ("Arch Coal",                 2016, "ACI"),
+    ("Peabody Energy",            2016, "BTU"),
+    ("SunEdison",                 2016, "SUNE"),
+    ("Aeropostale",               2016, "ARO"),
+    ("Gymboree",                  2017, "GYMB"),
+    # ── 2018–2020 ─────────────────────────────────────────────────────────────
+    ("Sears Holdings",            2018, "SHLD"),
+    ("PG&E Corporation",          2019, "PCG"),
+    ("Pier 1 Imports",            2020, "PIR"),
+    ("J.C. Penney",               2020, "JCP"),
+    ("Chesapeake Energy",         2020, "CHK"),
+    ("Hertz Global Holdings",     2020, "HTZ"),
+    ("Frontier Communications",   2020, "FTR"),
+    ("Whiting Petroleum",         2020, "WLL"),
+    ("Diamond Offshore Drilling", 2020, "DO"),
+    # ── 2021–2023 ─────────────────────────────────────────────────────────────
+    ("Revlon",                    2022, "REV"),
+    ("Bed Bath Beyond",           2023, "BBBY"),
+    ("Rite Aid",                  2023, "RAD"),
+    ("Yellow Corporation",        2023, "YELL"),
+    ("WeWork",                    2023, "WE"),
+]
+
+
+def get_bankruptcy_labels() -> pd.DataFrame:
+    """
+    Resolve KNOWN_BANKRUPTCY_SEED → DataFrame[cik, company_name, bankruptcy_date, …].
+
+    bankruptcy_date = Chapter 11 filing date (year-06-15 as proxy for mid-year).
+    Labeler marks the 2 fiscal years before filing as is_bankrupt=1.
+    """
+    logger.info(f"Resolving bankruptcy seed list ({len(KNOWN_BANKRUPTCY_SEED)} entries)…")
+    df = _resolve_seed(
+        seed=KNOWN_BANKRUPTCY_SEED,
+        label_col="bankruptcy_date",
+        label_date_fn=lambda y: f"{y}-06-15",
+    )
+    logger.info(
+        f"Bankruptcy labels resolved: {len(df)} / {len(KNOWN_BANKRUPTCY_SEED)} companies"
+    )
     return df
 
 

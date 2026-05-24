@@ -49,14 +49,37 @@ def run_evaluation(
     distress_model    : fitted DistressModel instance
     test_year_cutoff  : years >= this are used as the hold-out test set
     """
-    # ── Split into train / test ───────────────────────────────────────────────
-    test_df  = labeled_df[labeled_df["year"] >= test_year_cutoff].copy()
+    # ── Split into train / test (company-level exclusion) ────────────────────
+    # Time split first
     train_df = labeled_df[labeled_df["year"] <  test_year_cutoff].copy()
+    test_df  = labeled_df[labeled_df["year"] >= test_year_cutoff].copy()
 
-    logger.info(f"Test set: {len(test_df):,} rows "
-                f"({test_df['year'].min()}–{test_df['year'].max()}), "
-                f"fraud={test_df['is_fraud'].sum()}, "
-                f"bankrupt={test_df['is_bankrupt'].sum()}")
+    # Remove from test any company whose fraud/bankrupt label appeared in training.
+    # Without this, the model trivially recognises GE as a fraud company in test
+    # because it saw GE's earlier years (also labelled fraud) during training —
+    # giving inflated AUC (0.99) that means nothing for unseen companies.
+    train_labeled_ciks = set(
+        train_df.loc[train_df["is_fraud"]   == 1, "cik"].tolist() +
+        train_df.loc[train_df["is_bankrupt"]== 1, "cik"].tolist()
+    )
+    # Keep test rows where either:
+    #   a) the company was never labelled in training (genuine unseen company), OR
+    #   b) the row itself is clean (we still need clean samples in test)
+    test_df = test_df[
+        ~test_df["cik"].isin(train_labeled_ciks) |   # unseen fraud/bk company
+        (test_df["is_fraud"] == 0) & (test_df["is_bankrupt"] == 0)  # clean rows OK
+    ].copy()
+
+    n_excluded = labeled_df["cik"].isin(train_labeled_ciks).sum()
+    logger.info(
+        f"Train set: {len(train_df):,} rows (pre-{test_year_cutoff}), "
+        f"fraud={train_df['is_fraud'].sum()}, bankrupt={train_df['is_bankrupt'].sum()}"
+    )
+    logger.info(
+        f"Test set : {len(test_df):,} rows ({test_year_cutoff}+), "
+        f"fraud={test_df['is_fraud'].sum()}, bankrupt={test_df['is_bankrupt'].sum()} "
+        f"[{n_excluded:,} rows excluded — companies seen in training]"
+    )
 
     results = {}
 
